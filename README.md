@@ -52,13 +52,20 @@ app/src/main/java/com/rea/ring/
 
 ## 构建
 
+**环境**：JDK 17+、Android SDK 35、Gradle 8.7+
+
 ```bash
-# 需要 JDK 17+ 与 Android SDK 35
+# 1) 指定 SDK 路径
 echo "sdk.dir=/path/to/Android/sdk" > local.properties
-./gradlew assembleDebug
+
+# 2A) 用 Android Studio 直接打开本目录，点 Run
+# 2B) 或命令行构建
+gradle assembleDebug
 ```
 
 产物：`app/build/outputs/apk/debug/app-debug.apk`
+
+> 仓库未内置 Gradle Wrapper，如需可先执行 `gradle wrapper` 生成。
 
 ## 权限
 
