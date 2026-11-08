@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Kotlin
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+
+# Local config
+local.properties
+
+# Artifacts
+*.apk
+*.aab
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
