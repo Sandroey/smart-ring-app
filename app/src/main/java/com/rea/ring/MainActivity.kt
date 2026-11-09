@@ -54,6 +54,7 @@ val METRICS = listOf(
     MetricInfo("heart", "心率", "bpm", Accent),
     MetricInfo("bp", "血压", "mmHg", Color(0xFFF87171)),
     MetricInfo("spo2", "血氧", "%", Color(0xFF38BDF8)),
+    MetricInfo("temp", "体温", "°C", Color(0xFFFF9F7A)),
     MetricInfo("hrv", "HRV", "ms", Color(0xFFFBBF24)),
     MetricInfo("stress", "个人压力", "", Color(0xFFF472B6)),
     MetricInfo("steps", "运动步数", "步", Color(0xFF34D399)),
@@ -297,6 +298,10 @@ fun MetricCard(
         }
         "steps" -> if (todaySteps >= 0 && st != null) todaySteps.toString() else "--"
         "sleep" -> if (sleepTotal > 0) fmtDur(sleepTotal) else "--"
+        "temp" -> {
+            val t = state.temp ?: st?.last?.let { it / 100.0 }
+            if (t != null) String.format("%.1f", t) else "--"
+        }
         else -> live?.toString() ?: st?.last?.toString() ?: "--"
     }
     Column(
@@ -316,12 +321,19 @@ fun MetricCard(
         val sub = when {
             mi.key == "sleep" && sleepTotal > 0 -> "深睡 " + fmtDur(sleepDeep) + " · REM " + fmtDur(sleepRem)
             mi.key == "sleep" -> "昨晚暂无"
+            mi.key == "temp" -> "设备不支持体温传感器"
             st == null -> "今日暂无"
             mi.key == "steps" -> if ((st?.count ?: 0) > 0) "今日累计" else "今日暂无"
             mi.key == "battery" -> "更新 " + fmtTime(st.lastTs)
+            mi.key == "temp" -> "今日 " + st.count + " 次 · " +
+                String.format("%.1f", st.min / 100.0) + "~" + String.format("%.1f", st.max / 100.0)
             else -> "今日 " + st.count + " 次 · " + st.min + "~" + st.max
         }
         Text(sub, color = Muted, fontSize = 10.sp)
+        if (st != null && (mi.key == "hrv" || mi.key == "stress") &&
+            System.currentTimeMillis() - st.lastTs > 2L * 3600 * 1000) {
+            Text("数据较旧：戒指未同步历史", color = Color(0xFFF87171), fontSize = 9.sp)
+        }
         if (st != null && mi.key != "steps" && mi.key != "battery" && mi.key != "sleep") {
             Text("更新 " + fmtTime(st.lastTs), color = Muted, fontSize = 10.sp)
         }
@@ -529,13 +541,15 @@ fun DetailScreen(mi: MetricInfo, onBack: () -> Unit) {
     var tick by remember { mutableStateOf(0) }
 
     LaunchedEffect(mi.key, range, st.lastRx, tick) {
+        // temp 存的是百分之一度，展示时统一按 0.1 度处理
         val since = when (range) {
             0 -> startOfToday()
             1 -> System.currentTimeMillis() - 7L * 24 * 3600 * 1000
             else -> 0L
         }
         val key = if (mi.key == "bp") "bp_sys" else mi.key
-        series = Store.get(ctx).seriesSince(key, since, 300)
+        val raw = Store.get(ctx).seriesSince(key, since, 300)
+        series = if (mi.key == "temp") raw.map { it.first to it.second / 10 } else raw
         if (mi.key == "bp") series2 = Store.get(ctx).seriesSince("bp_dia", since, 300)
     }
 
@@ -574,11 +588,12 @@ fun DetailScreen(mi: MetricInfo, onBack: () -> Unit) {
             } else {
                 val mn = series.minOf { it.second }
                 val mx = series.maxOf { it.second }
-                val avg = series.map { it.second }.average().toInt()
+                val avg = series.map { it.second }.average()
+                fun f(v: Number): String = if (mi.key == "temp") String.format("%.1f", v.toDouble() / 10.0) else v.toInt().toString()
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Stat("最低", mn.toString(), mi.unit)
-                    Stat("平均", avg.toString(), mi.unit)
-                    Stat("最高", mx.toString(), mi.unit)
+                    Stat("最低", f(mn), mi.unit)
+                    Stat("平均", f(avg), mi.unit)
+                    Stat("最高", f(mx), mi.unit)
                 }
                 Spacer(Modifier.height(10.dp))
                 Chart(series, mi.color, series2, Color(0xFF60A5FA), mi.unit, mi.key == "bp")

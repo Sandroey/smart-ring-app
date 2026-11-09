@@ -43,6 +43,7 @@ data class RingState(
     val lastRx: Long = 0L,
     val gestureMode: Int = 0,
     val tapCount: Int = 0,
+    val temp: Double? = null,
     val tapAt: Long = 0L,
     val waveOn: Boolean = false,
     val waveform: List<Int> = emptyList(),
@@ -233,6 +234,7 @@ object Ring {
             ui.postDelayed({ startScheduler() }, 1500)
             ui.postDelayed({ syncHistory() }, 3000)
             ui.postDelayed({ heartbeatLoop() }, 8000)
+            ui.postDelayed({ syncTime() }, 2000)
             ui.postDelayed({ armGesture() }, 3000)
             armLoop()
             push("服务就绪")
@@ -324,9 +326,11 @@ object Ring {
 
     fun measureAll() {
         if (!_state.value.connected) return
-        if (measuring) { push("测量进行中…"); return }
+        val nowTs = System.currentTimeMillis()
+        if (measuring && nowTs - cycleStart < 6 * 60 * 1000L) { push("测量进行中…"); return }
         measuring = true
-        cycleStart = System.currentTimeMillis()
+        cycleStart = nowTs
+        syncTime()
         stopAll()
         ui.postDelayed({
             push("全量测量：心率")
@@ -362,11 +366,64 @@ object Ring {
         ui.postDelayed({
             send(0x0200, byteArrayOf(0x47, 0x43))
             send(0x0509, ByteArray(0))
+            syncSleep()
             val ctx = appCtx
             val got = if (ctx != null) Store.get(ctx).statsSince("heart", cycleStart)?.count ?: 0 else 0
+            val tNow = _state.value.temp
             measuring = false
-            push(if (got > 0) "全量测量：完成" else "未检测到佩戴，请戴好后重测")
+            push(
+                when {
+                    got > 0 -> "全量测量：完成"
+                    tNow != null && tNow < 32.0 -> "未检测到佩戴（温度 " + String.format("%.1f", tNow) + "°C）"
+                    else -> "未检测到佩戴，请戴好后重测"
+                }
+            )
         }, 220000)
+        ui.postDelayed({ measuring = false }, 240000)
+    }
+
+    @Volatile private var lastSleepDataAt = 0L
+    private var sleepTry = 0
+
+    fun syncSleep() {
+        if (!_state.value.connected) return
+        sleepTry = 0
+        requestSleep()
+    }
+
+    private fun requestSleep() {
+        if (!_state.value.connected) return
+        sleepTry++
+        send(0x0504, ByteArray(0))
+        push("同步睡眠（第 " + sleepTry + " 次）")
+        ui.postDelayed({
+            if (sleepTry < 3 && System.currentTimeMillis() - lastSleepDataAt > 25_000L) requestSleep()
+        }, 25_000L)
+    }
+
+    fun syncTime() {
+        val c = java.util.Calendar.getInstance()
+        val y = c.get(java.util.Calendar.YEAR)
+        val dow = c.get(java.util.Calendar.DAY_OF_WEEK)
+        val wd = if (dow == 1) 6 else dow - 2
+        val p = byteArrayOf(
+            (y and 0xFF).toByte(), ((y shr 8) and 0xFF).toByte(),
+            (c.get(java.util.Calendar.MONTH) + 1).toByte(),
+            c.get(java.util.Calendar.DAY_OF_MONTH).toByte(),
+            c.get(java.util.Calendar.HOUR_OF_DAY).toByte(),
+            c.get(java.util.Calendar.MINUTE).toByte(),
+            c.get(java.util.Calendar.SECOND).toByte(),
+            wd.toByte()
+        )
+        send(0x0100, p)
+        // 时区 + 纪元秒（部分固件用它设置 RTC）
+        val now = System.currentTimeMillis() / 1000
+        val offH = java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000
+        val tz = ByteArray(9)
+        for (i in 0 until 8) tz[i] = ((now shr (8 * i)) and 0xFF).toByte()
+        tz[8] = offH.toByte()
+        send(0x0144, tz)
+        push("已校准戒指时间")
     }
 
     fun syncLatest() {
@@ -466,6 +523,98 @@ object Ring {
         Log.d(TAG, "photo: shutter -> " + svc.tapShutter())
     }
 
+    private val histBuf = ArrayList<Byte>()
+    private val histFlush = Runnable { parseHistoryBuffer() }
+
+    private fun parseHistoryBuffer() {
+        val ctx = appCtx ?: return
+        if (histBuf.isEmpty()) return
+        val buf = ByteArray(histBuf.size)
+        for (i in histBuf.indices) buf[i] = histBuf[i]
+        histBuf.clear()
+        if (buf.size < 20) return
+        val tz = java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis())
+        var start = -1
+        var bestScore = 0
+        for (off in 0 until 20) {
+            var i2 = off
+            var prev = 0L
+            var score = 0
+            while (i2 + 20 <= buf.size) {
+                val ts2 = (le32(buf, i2) + 946684800L) * 1000L - tz
+                if (saneTs(ts2)) {
+                    if (ts2 >= prev) score++
+                    prev = ts2
+                }
+                i2 += 20
+            }
+            if (score > bestScore) { bestScore = score; start = off }
+        }
+        Log.d(TAG, "history align offset=" + start + " score=" + bestScore + " len=" + buf.size)
+        if (start < 0 || bestScore < 2) return
+        var i = start
+        var n = 0
+        val db = Store.get(ctx)
+        // 零时间戳兜底：设备 RTC 丢失时，用"最近一条"的值打上当前时间
+        var fbHr = 0; var fbSbp = 0; var fbDbp = 0; var fbO2 = 0
+        var fbHrv = 0; var fbResp = 0; var fbTemp = 0; var fbSteps = 0
+        while (i + 20 <= buf.size) {
+            val ts = (le32(buf, i) + 946684800L) * 1000L - tz
+            if (!saneTs(ts)) {
+                val h2 = buf[i + 6].toInt() and 0xFF
+                val s2 = buf[i + 7].toInt() and 0xFF
+                val d2 = buf[i + 8].toInt() and 0xFF
+                val o2v = buf[i + 9].toInt() and 0xFF
+                val r2 = buf[i + 10].toInt() and 0xFF
+                val v2 = buf[i + 11].toInt() and 0xFF
+                val t2 = buf[i + 13].toInt() and 0xFF
+                val st2 = (buf[i + 4].toInt() and 0xFF) or ((buf[i + 5].toInt() and 0xFF) shl 8)
+                if (h2 in 25..220) fbHr = h2
+                if (s2 in 60..200 && d2 in 30..140) { fbSbp = s2; fbDbp = d2 }
+                if (o2v in 70..100) fbO2 = o2v
+                if (r2 in 5..40) fbResp = r2
+                if (v2 in 1..250) fbHrv = v2
+                if (t2 in 30..42) fbTemp = t2
+                if (st2 > 0) fbSteps = st2
+                i += 20; continue
+            }
+            val steps = (buf[i + 4].toInt() and 0xFF) or ((buf[i + 5].toInt() and 0xFF) shl 8)
+            val hr = buf[i + 6].toInt() and 0xFF
+            val sbp = buf[i + 7].toInt() and 0xFF
+            val dbp = buf[i + 8].toInt() and 0xFF
+            val o2 = buf[i + 9].toInt() and 0xFF
+            val resp = buf[i + 10].toInt() and 0xFF
+            val hrvs = buf[i + 11].toInt() and 0xFF
+            val tInt = buf[i + 13].toInt() and 0xFF
+            val tFrac = buf[i + 14].toInt() and 0xFF
+            if (steps > 0) db.insert("steps", steps, ts)
+            if (hr in 25..220) db.insert("heart", hr, ts)
+            if (sbp in 60..200 && dbp in 30..140) {
+                db.insert("bp_sys", sbp, ts)
+                db.insert("bp_dia", dbp, ts)
+            }
+            if (o2 in 70..100) db.insert("spo2", o2, ts)
+            if (hrvs in 1..200) db.insert("hrv", hrvs, ts)
+            if (resp in 5..40) db.insert("resp", resp, ts)
+            if (tInt in 30..42) {
+                val centi = tInt * 100 + tFrac
+                db.insert("temp", centi, ts)
+                _state.update { it.copy(temp = centi / 100.0) }
+            }
+            n++
+            i += 20
+        }
+        val nowTs = System.currentTimeMillis()
+        if (fbHr > 0) db.insert("heart", fbHr, nowTs)
+        if (fbSbp > 0) { db.insert("bp_sys", fbSbp, nowTs); db.insert("bp_dia", fbDbp, nowTs) }
+        if (fbO2 > 0) db.insert("spo2", fbO2, nowTs)
+        if (fbResp > 0) db.insert("resp", fbResp, nowTs)
+        if (fbHrv > 0) db.insert("hrv", fbHrv, nowTs)
+        if (fbTemp > 0) db.insert("temp", fbTemp * 100, nowTs)
+        if (fbSteps > 0) db.insert("steps", fbSteps, nowTs)
+        if (n > 0 || fbHrv > 0) push("历史 " + n + " 条" + if (fbHrv > 0) " · HRV " + fbHrv else "")
+    }
+
     private fun armLoop() {
         ui.postDelayed(object : Runnable {
             override fun run() {
@@ -499,6 +648,7 @@ object Ring {
             } else i++
         }
         if (segs.isNotEmpty()) {
+            lastSleepDataAt = System.currentTimeMillis()
             Store.get(ctx).insertSleepSegs(segs)
             push("睡眠 " + segs.size + " 段")
         }
@@ -578,6 +728,13 @@ object Ring {
                 if (batt in 1..100) { save("battery", batt, 0); _state.update { it.copy(battery = batt) } }
                 _state.update { it.copy(firmware = fw) }
             }
+            0x0504 -> if (payload.size >= 8) {
+                val cnt = (payload[2].toInt() and 0xFF) or ((payload[3].toInt() and 0xFF) shl 8) or
+                    ((payload[4].toInt() and 0xFF) shl 16) or ((payload[5].toInt() and 0xFF) shl 24)
+                Log.d(TAG, "sleep ack records=" + cnt)
+                if (cnt == 0) push("睡眠：设备暂无新数据")
+                else lastSleepDataAt = System.currentTimeMillis()
+            }
             0x0513 -> {
                 for (b in payload) sleepBuf.add(b)
                 val need = if (sleepBuf.size >= 5 && (sleepBuf[0].toInt() and 0xFF) == 0xAF) {
@@ -589,39 +746,14 @@ object Ring {
                     sleepBuf.clear()
                 }
             }
-            0x0580 -> if (sleepBuf.isNotEmpty()) parseSleepBuffer()
-            0x0518 -> if (ctx != null) {
-                var i = 0
-                var n = 0
-                val tzOff = java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis())
-                while (i + 20 <= payload.size) {
-                    val ts = (le32(payload, i) + 946684800L) * 1000L - tzOff
-                    if (!saneTs(ts)) { i += 20; continue }
-                    val steps = (payload[i + 4].toInt() and 0xFF) or ((payload[i + 5].toInt() and 0xFF) shl 8)
-                    val hr = payload[i + 6].toInt() and 0xFF
-                    val sbp = payload[i + 7].toInt() and 0xFF
-                    val dbp = payload[i + 8].toInt() and 0xFF
-                    val o2 = payload[i + 9].toInt() and 0xFF
-                    val resp = payload[i + 10].toInt() and 0xFF
-                    val hrvs = payload[i + 11].toInt() and 0xFF
-                    val db = Store.get(ctx)
-                    if (steps > 0) db.insert("steps", steps, ts)
-                    if (hr in 25..220) db.insert("heart", hr, ts)
-                    if (sbp in 60..200 && dbp in 30..140) {
-                        db.insert("bp_sys", sbp, ts)
-                        db.insert("bp_dia", dbp, ts)
-                    }
-                    if (o2 in 70..100) db.insert("spo2", o2, ts)
-                    if (hrvs in 1..200) {
-                        db.insert("hrv", hrvs, ts)
-                        val stress = (90.0 - hrvs * 0.75).toInt().coerceIn(5, 95)
-                        db.insert("stress", stress, ts)
-                    }
-                    if (resp in 5..40) db.insert("resp", resp, ts)
-                    n++
-                    i += 20
-                }
-                push("全部历史 " + n + " 条")
+            0x0580 -> {
+                if (sleepBuf.isNotEmpty()) parseSleepBuffer()
+                if (histBuf.isNotEmpty()) { ui.removeCallbacks(histFlush); parseHistoryBuffer() }
+            }
+            0x0518 -> {
+                for (b in payload) histBuf.add(b)
+                ui.removeCallbacks(histFlush)
+                ui.postDelayed(histFlush, 1200)
             }
             0x0515 -> if (ctx != null) {
                 var i = 0; var n = 0
@@ -644,6 +776,7 @@ object Ring {
                 } else {
                     val mode = if (ctx != null) GesturePrefs.mode(ctx) else GesturePrefs.OFF
                     Log.d(TAG, "0403 trigger mode=" + mode)
+                    send(0x0403, byteArrayOf(0))
                     when (mode) {
                         GesturePrefs.SWIPE -> {
                             ui.postDelayed({ armGesture() }, 1500)
@@ -687,6 +820,15 @@ object Ring {
                     _state.update { it.copy(bpSys = sbp, bpDia = dbp) }
                 }
                 if (hrvs in 1..200) { save("hrv", hrvs, 0); _state.update { it.copy(hrv = hrvs) } }
+                if (payload.size >= 7) {
+                    val tInt = payload[5].toInt() and 0xFF
+                    val tFrac = payload[6].toInt() and 0xFF
+                    if (tInt in 30..42) {
+                        val centi = tInt * 100 + tFrac
+                        save("temp", centi, 0)
+                        _state.update { it.copy(temp = centi / 100.0) }
+                    }
+                }
             }
             0x040E -> if (payload.size >= 2 && (payload[1].toInt() and 0xFF) == 0x02) {
                 push("测量失败：可能未佩戴")
