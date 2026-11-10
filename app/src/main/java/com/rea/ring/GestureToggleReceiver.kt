@@ -7,6 +7,12 @@ import android.widget.Toast
 
 class GestureToggleReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == "com.rea.ring.TEST_ALARM") {
+            Ring.attach(context)
+            AlarmScheduler.scheduleIn(context, 5000L)
+            android.util.Log.d("ReaRing", "test alarm scheduled in 5s")
+            return
+        }
         if (intent?.action == "com.rea.ring.TEST_PHOTO") {
             Ring.takePhotoByGesture(context)
             return

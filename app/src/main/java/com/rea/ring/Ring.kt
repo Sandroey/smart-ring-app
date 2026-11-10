@@ -302,6 +302,11 @@ object Ring {
         val dev = ad.getRemoteDevice(address)
         Log.d(TAG, "connect -> $address")
         lastAddress = address
+        try {
+            appCtx?.getSharedPreferences("ring_conn", android.content.Context.MODE_PRIVATE)
+                ?.edit()?.putString("addr", address)?.apply()
+        } catch (_: Exception) {}
+
         appCtx = ctx.applicationContext
         push("连接 $address …")
         gatt = dev.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -324,12 +329,33 @@ object Ring {
     @Volatile private var measuring = false
     private var cycleStart = 0L
 
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+
+    private fun acquireWake() {
+        val ctx = appCtx ?: return
+        try {
+            if (wakeLock == null) {
+                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "ReaRing:measure")
+                wakeLock?.setReferenceCounted(false)
+            }
+            wakeLock?.acquire(6 * 60 * 1000L)
+        } catch (e: Exception) {
+            Log.d(TAG, "wakelock fail " + e.message)
+        }
+    }
+
+    private fun releaseWake() {
+        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+    }
+
     fun measureAll() {
         if (!_state.value.connected) return
         val nowTs = System.currentTimeMillis()
         if (measuring && nowTs - cycleStart < 6 * 60 * 1000L) { push("测量进行中…"); return }
         measuring = true
         cycleStart = nowTs
+        acquireWake()
         syncTime()
         stopAll()
         ui.postDelayed({
@@ -349,9 +375,14 @@ object Ring {
         }, 90000)
         ui.postDelayed({
             send(0x032F, byteArrayOf(0, 10))
-            send(0x032F, byteArrayOf(1, 12))
-            push("全量测量：压力")
+            send(0x0509, ByteArray(0))
+            push("全量测量：HRV / 压力")
         }, 125000)
+        ui.postDelayed({
+            send(0x032F, byteArrayOf(1, 12))
+        }, 145000)
+        ui.postDelayed({ send(0x0509, ByteArray(0)) }, 160000)
+        ui.postDelayed({ send(0x0509, ByteArray(0)) }, 195000)
         ui.postDelayed({
             send(0x032F, byteArrayOf(0, 12))
             send(0x032F, byteArrayOf(1, 1))
@@ -437,7 +468,16 @@ object Ring {
     fun startScheduler() {
         if (cycleRunning) return
         cycleRunning = true
-        measureAll()
+        val ctx = appCtx
+        if (ctx != null) AlarmScheduler.schedule(ctx)
+        val stale = ctx?.let {
+            val last = Store.get(it).latest("heart")
+            last == null || System.currentTimeMillis() - last.second > 45 * 60 * 1000L
+        } ?: true
+        if (stale) {
+            push("数据已过期，立即补测")
+            measureAll()
+        }
         ui.postDelayed(object : Runnable {
             override fun run() {
                 measureAll()
@@ -504,6 +544,26 @@ object Ring {
     fun stopSpo2() { send(0x032F, byteArrayOf(0, 2)) }
 
     @Volatile private var lastTapAt = 0L
+    fun ensureConnected(ctx: Context) {
+        appCtx = ctx.applicationContext
+        if (_state.value.connected) return
+        val addr = lastAddress ?: try {
+            ctx.getSharedPreferences("ring_conn", android.content.Context.MODE_PRIVATE)
+                .getString("addr", null)
+        } catch (_: Exception) { null }
+        if (addr != null) {
+            Log.d(TAG, "ensureConnected -> " + addr)
+            connect(ctx, addr)
+        } else {
+            Log.d(TAG, "ensureConnected: no saved device")
+        }
+    }
+
+    fun attach(ctx: Context) {
+        appCtx = ctx.applicationContext
+        _state.update { it.copy(gestureMode = GesturePrefs.mode(ctx)) }
+    }
+
     fun updateGestureMode(ctx: Context) {
         _state.update { it.copy(gestureMode = GesturePrefs.mode(ctx)) }
         armGesture()
@@ -589,10 +649,7 @@ object Ring {
             val tFrac = buf[i + 14].toInt() and 0xFF
             if (steps > 0) db.insert("steps", steps, ts)
             if (hr in 25..220) db.insert("heart", hr, ts)
-            if (sbp in 60..200 && dbp in 30..140) {
-                db.insert("bp_sys", sbp, ts)
-                db.insert("bp_dia", dbp, ts)
-            }
+            if (sbp in 60..200 && dbp in 30..140) db.insertBp(sbp, dbp, ts)
             if (o2 in 70..100) db.insert("spo2", o2, ts)
             if (hrvs in 1..200) db.insert("hrv", hrvs, ts)
             if (resp in 5..40) db.insert("resp", resp, ts)
@@ -606,12 +663,13 @@ object Ring {
         }
         val nowTs = System.currentTimeMillis()
         if (fbHr > 0) db.insert("heart", fbHr, nowTs)
-        if (fbSbp > 0) { db.insert("bp_sys", fbSbp, nowTs); db.insert("bp_dia", fbDbp, nowTs) }
+        if (fbSbp > 0 && fbDbp > 0) db.insertBp(fbSbp, fbDbp, nowTs)
         if (fbO2 > 0) db.insert("spo2", fbO2, nowTs)
         if (fbResp > 0) db.insert("resp", fbResp, nowTs)
         if (fbHrv > 0) db.insert("hrv", fbHrv, nowTs)
         if (fbTemp > 0) db.insert("temp", fbTemp * 100, nowTs)
         if (fbSteps > 0) db.insert("steps", fbSteps, nowTs)
+        if (n > 0 || fbHrv > 0) { try { db.recomputeStress() } catch (_: Exception) {} }
         if (n > 0 || fbHrv > 0) push("历史 " + n + " 条" + if (fbHrv > 0) " · HRV " + fbHrv else "")
     }
 
@@ -815,9 +873,19 @@ object Ring {
                 val sbp = payload[0].toInt() and 0xFF
                 val dbp = payload[1].toInt() and 0xFF
                 val hrvs = payload[3].toInt() and 0xFF
-                if (sbp in 60..200 && dbp in 30..140) {
-                    save("bp_sys", sbp, 0); save("bp_dia", dbp, 0)
-                    _state.update { it.copy(bpSys = sbp, bpDia = dbp) }
+                if (sbp in 60..200) {
+                    if (dbp in 30..140) {
+                        _state.update { it.copy(bpSys = sbp, bpDia = dbp) }
+                        val now = System.currentTimeMillis()
+                        val last = lastSaved["bp_sys"] ?: 0L
+                        if (now - last >= 30000L) {
+                            lastSaved["bp_sys"] = now
+                            lastSaved["bp_dia"] = now
+                            appCtx?.let { Store.get(it).insertBp(sbp, dbp, now) }
+                        }
+                    } else {
+                        _state.update { it.copy(bpSys = sbp) }
+                    }
                 }
                 if (hrvs in 1..200) { save("hrv", hrvs, 0); _state.update { it.copy(hrv = hrvs) } }
                 if (payload.size >= 7) {
@@ -830,8 +898,15 @@ object Ring {
                     }
                 }
             }
-            0x040E -> if (payload.size >= 2 && (payload[1].toInt() and 0xFF) == 0x02) {
-                push("测量失败：可能未佩戴")
+            0x040E -> if (payload.size >= 2) {
+                val mtype = payload[0].toInt() and 0xFF
+                val code = payload[1].toInt() and 0xFF
+                if (code == 0x02) push("测量失败：可能未佩戴")
+                if (mtype == 10 || mtype == 12) {
+                    ui.postDelayed({ send(0x0509, ByteArray(0)) }, 3000)
+                    ui.postDelayed({ send(0x0509, ByteArray(0)) }, 25000)
+                    ui.postDelayed({ send(0x0509, ByteArray(0)) }, 60000)
+                }
             }
             0x0615 -> if (payload.isNotEmpty()) {
                 val v = payload[0].toInt() and 0xFF

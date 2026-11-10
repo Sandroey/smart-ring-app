@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
 import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
 import androidx.compose.foundation.lazy.staggeredgrid.items
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -302,7 +303,7 @@ fun MetricCard(
             val t = state.temp ?: st?.last?.let { it / 100.0 }
             if (t != null) String.format("%.1f", t) else "--"
         }
-        else -> live?.toString() ?: st?.last?.toString() ?: "--"
+        else -> st?.last?.toString() ?: live?.toString() ?: "--"
     }
     Column(
         modifier = Modifier
@@ -361,14 +362,17 @@ fun SleepScreen(onBack: () -> Unit) {
     var segs by remember { mutableStateOf<List<Triple<Long, Int, Int>>>(emptyList()) }
     var tick by remember { mutableStateOf(0) }
     var sel by remember { mutableStateOf<Int?>(null) }
-    LaunchedEffect(st.lastRx, tick) {
-        segs = Store.get(ctx).lastSleepSession()
+    var dayOffset by remember { mutableStateOf(0) }
+    LaunchedEffect(st.lastRx, tick, dayOffset) {
+        val anchor = startOfToday() - dayOffset * 86400000L + 12 * 3600 * 1000L
+        segs = Store.get(ctx).sleepNight(anchor)
     }
     val deep = segs.filter { it.third == 3 }.sumOf { it.second }
     val light = segs.filter { it.third == 1 }.sumOf { it.second }
     val rem = segs.filter { it.third == 2 }.sumOf { it.second }
     val total = segs.sumOf { it.second }
     val deepColor = Color(0xFF4338CA)
+
     val lightColor = Color(0xFF818CF8)
     val remColor = Color(0xFF22D3EE)
 
@@ -381,6 +385,33 @@ fun SleepScreen(onBack: () -> Unit) {
                 Ring.measure("sleep")
                 tick++
             })
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            for (k in 0 until 14) {
+                val dayTs = startOfToday() - k * 86400000L
+                val label = when (k) {
+                    0 -> "今天"
+                    1 -> "昨天"
+                    2 -> "前天"
+                    else -> {
+                        val c = java.util.Calendar.getInstance().apply { timeInMillis = dayTs }
+                        String.format("%d/%d", c.get(java.util.Calendar.MONTH) + 1, c.get(java.util.Calendar.DAY_OF_MONTH))
+                    }
+                }
+                val on = dayOffset == k
+                Box(
+                    Modifier
+                        .background(if (on) Accent.copy(alpha = 0.18f) else CardBg, RoundedCornerShape(14.dp))
+                        .clickable { dayOffset = k }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(label, color = if (on) Accent else Muted, fontSize = 12.sp)
+                }
+            }
         }
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.Bottom) {

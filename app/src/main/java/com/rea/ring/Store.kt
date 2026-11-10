@@ -105,6 +105,40 @@ class Store private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "ring.db",
         }
     }
 
+    fun insertBp(sys: Int, dia: Int, ts: Long) {
+        if (sys !in 60..200 || dia !in 30..140) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            insert("bp_sys", sys, ts)
+            insert("bp_dia", dia, ts)
+            db.setTransactionSuccessful()
+        } catch (_: Exception) {
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun diaNear(ts: Long, windowMs: Long = 10 * 60 * 1000L): Int? {
+        readableDatabase.rawQuery(
+            "SELECT value FROM samples WHERE metric='bp_dia' AND ts BETWEEN ? AND ? ORDER BY ABS(ts-?) LIMIT 1",
+            arrayOf((ts - windowMs).toString(), (ts + windowMs).toString(), ts.toString())
+        ).use { c -> return if (c.moveToFirst()) c.getInt(0) else null }
+    }
+
+    fun sleepNight(anchor: Long): List<Triple<Long, Int, Int>> {
+        val hi = anchor
+        val lo = anchor - 18L * 3600 * 1000
+        val out = ArrayList<Triple<Long, Int, Int>>()
+        readableDatabase.rawQuery(
+            "SELECT ts, seconds, stage FROM sleep_seg WHERE ts>=? AND ts<=? ORDER BY ts ASC",
+            arrayOf(lo.toString(), hi.toString())
+        ).use { c ->
+            while (c.moveToNext()) out.add(Triple(c.getLong(0), c.getInt(1), c.getInt(2)))
+        }
+        return out
+    }
+
     fun latest(metric: String): Pair<Int, Long>? {
         readableDatabase.query("samples", arrayOf("value", "ts"), "metric=?", arrayOf(metric), null, null, "ts DESC", "1").use { c ->
             return if (c.moveToFirst()) Pair(c.getInt(0), c.getLong(1)) else null
