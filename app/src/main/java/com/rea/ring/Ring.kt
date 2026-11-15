@@ -669,7 +669,12 @@ object Ring {
         if (fbHrv > 0) db.insert("hrv", fbHrv, nowTs)
         if (fbTemp > 0) db.insert("temp", fbTemp * 100, nowTs)
         if (fbSteps > 0) db.insert("steps", fbSteps, nowTs)
-        if (n > 0 || fbHrv > 0) { try { db.recomputeStress() } catch (_: Exception) {} }
+        if (n > 0 || fbHrv > 0) {
+            try {
+                db.recomputeStress()
+                db.latest("stress")?.let { s -> ctx?.let { c -> Alerts.onSample(c, "stress", null, s.first) } }
+            } catch (_: Exception) {}
+        }
         if (n > 0 || fbHrv > 0) push("历史 " + n + " 条" + if (fbHrv > 0) " · HRV " + fbHrv else "")
     }
 
@@ -741,9 +746,11 @@ object Ring {
         val last = lastSaved[metric] ?: 0L
         if (now - last < 30000L) { Log.d(TAG, "save $metric skip(throttle)"); return }
         lastSaved[metric] = now
+        val prev = try { Store.get(ctx).latest(metric)?.first } catch (e: Exception) { null }
         try {
             Store.get(ctx).insert(metric, value, stamp)
             Log.d(TAG, "save $metric=$value ts=$stamp ok")
+            Alerts.onSample(ctx, metric, prev, value)
         } catch (e: Exception) { Log.d(TAG, "save $metric fail: " + e.message) }
     }
 
@@ -881,7 +888,11 @@ object Ring {
                         if (now - last >= 30000L) {
                             lastSaved["bp_sys"] = now
                             lastSaved["bp_dia"] = now
-                            appCtx?.let { Store.get(it).insertBp(sbp, dbp, now) }
+                            appCtx?.let {
+                                val p = try { Store.get(it).latest("bp_sys")?.first } catch (e: Exception) { null }
+                                Store.get(it).insertBp(sbp, dbp, now)
+                                Alerts.onSample(it, "bp", p, sbp)
+                            }
                         }
                     } else {
                         _state.update { it.copy(bpSys = sbp) }

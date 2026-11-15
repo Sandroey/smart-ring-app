@@ -7,6 +7,10 @@ import android.widget.Toast
 
 class GestureToggleReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == "com.rea.ring.TEST_ALERT") {
+            Alerts.onSample(context, "heart", 72, 138)
+            return
+        }
         if (intent?.action == "com.rea.ring.TEST_ALARM") {
             Ring.attach(context)
             AlarmScheduler.scheduleIn(context, 5000L)
