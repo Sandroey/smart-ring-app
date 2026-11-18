@@ -13,7 +13,9 @@ import android.util.Log
  */
 class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        Log.d("ReaRing", "alarm fire -> measure")
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        val quiet = hour >= 23 || hour < 7
+        Log.d("ReaRing", if (quiet) "alarm fire -> quiet sync" else "alarm fire -> measure")
         val app = context.applicationContext
         Ring.attach(app)
         try {
@@ -23,8 +25,8 @@ class AlarmReceiver : BroadcastReceiver() {
             Log.d("ReaRing", "start service fail " + e.message)
         }
         Ring.ensureConnected(app)
-        Ring.measureAll()
-        AlarmScheduler.schedule(app)
+        if (quiet) Ring.quietSync() else Ring.measureAll()
+        AlarmScheduler.scheduleNext(app)
     }
 }
 
@@ -40,7 +42,15 @@ object AlarmScheduler {
         return PendingIntent.getBroadcast(ctx, REQ, i, flags)
     }
 
-    fun schedule(ctx: Context) = scheduleIn(ctx, INTERVAL_MS)
+    fun schedule(ctx: Context) = scheduleNext(ctx)
+
+    /** 对齐到每个整点的 :00 / :20 / :40 触发 */
+    fun scheduleNext(ctx: Context) {
+        val slot = 20 * 60 * 1000L
+        val now = System.currentTimeMillis()
+        val next = ((now / slot) + 1) * slot
+        scheduleIn(ctx, next - now)
+    }
 
     fun scheduleIn(ctx: Context, delayMs: Long) {
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
@@ -49,10 +59,10 @@ object AlarmScheduler {
         try {
             if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
                 am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
-                Log.d(TAG, "alarm set (inexact) +30min")
+                Log.d(TAG, "alarm set (inexact) at " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(at)))
             } else {
                 am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
-                Log.d(TAG, "alarm set (exact) +30min")
+                Log.d(TAG, "alarm set (exact) at " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(at)))
             }
         } catch (e: Exception) {
             Log.d(TAG, "alarm set fail " + e.message)

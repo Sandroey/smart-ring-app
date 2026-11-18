@@ -234,6 +234,7 @@ object Ring {
             ui.postDelayed({ startScheduler() }, 1500)
             ui.postDelayed({ syncHistory() }, 3000)
             ui.postDelayed({ heartbeatLoop() }, 8000)
+            ui.postDelayed({ send(0x0226, ByteArray(0)) }, 2500)
             ui.postDelayed({ syncTime() }, 2000)
             ui.postDelayed({ armGesture() }, 3000)
             armLoop()
@@ -469,7 +470,7 @@ object Ring {
         if (cycleRunning) return
         cycleRunning = true
         val ctx = appCtx
-        if (ctx != null) AlarmScheduler.schedule(ctx)
+        if (ctx != null) AlarmScheduler.scheduleNext(ctx)
         val stale = ctx?.let {
             val last = Store.get(it).latest("heart")
             last == null || System.currentTimeMillis() - last.second > 45 * 60 * 1000L
@@ -478,12 +479,14 @@ object Ring {
             push("数据已过期，立即补测")
             measureAll()
         }
-        ui.postDelayed(object : Runnable {
-            override fun run() {
-                measureAll()
-                ui.postDelayed(this, 30 * 60 * 1000L)
-            }
-        }, 30 * 60 * 1000L)
+    }
+
+    /** 夜间静默：不启动测量，只同步历史（让戒指自己记录睡眠） */
+    fun quietSync() {
+        if (!_state.value.connected) return
+        send(0x0509, ByteArray(0))
+        ui.postDelayed({ send(0x0504, ByteArray(0)) }, 2500)
+        ui.postDelayed({ send(0x0504, ByteArray(0)) }, 20000)
     }
 
     private fun lightCycle() {
@@ -909,6 +912,7 @@ object Ring {
                     }
                 }
             }
+            0x0226 -> push("睡眠状态 " + Protocol.hex(payload))
             0x040E -> if (payload.size >= 2) {
                 val mtype = payload[0].toInt() and 0xFF
                 val code = payload[1].toInt() and 0xFF
